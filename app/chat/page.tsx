@@ -1,10 +1,9 @@
-/* app/chat/page.tsx  ◆ 2025‑05‑05 指示①〜⑤完全対応版 ─ Enter送信・API切替・追加削除&DnD
-   - デフォルトは OpenAI gpt‑3.5‑turbo（Geminiが未設定でも動く）
-   - Providerごとに「全モデル候補」をドロップダウン
-   - APIキーは ProviderごとにlocalStorage保存・後で再選択可
-   - プロジェクト／セッションの追加・削除 + DnD移動
-   - プロジェクト名 = 濃いグレー (#333)
+/* app/chat/page.tsx  ◆ session_id 型エラー修正込み・最新版
+   ────────────────────────────────────────────────
+   1) Message 型に session_id 追加（Netlify ビルドエラー解消）
+   2) 前回の指示①〜⑤（API選択・追加削除・DnD等）もすべて保持
 */
+
 'use client';
 
 import { useEffect, useState, KeyboardEvent } from 'react';
@@ -16,8 +15,19 @@ import { supabase } from '../../lib/supabaseClient';
 /* ---------- 型 ---------- */
 type Project  = { id: string; name: string };
 type Session  = { id: string; name: string; project_id: string };
-type Message  = { id: number; role: 'user' | 'assistant'; content: string };
+type Message  = {                     // ← ★ session_id を追加
+  id: number;
+  session_id: string;
+  role: 'user' | 'assistant';
+  content: string;
+};
 type Provider = 'openai' | 'gemini' | 'groq' | 'anthropic';
+
+type ApiCfg = {
+  provider: Provider;
+  model: string;
+  keys: Record<Provider,string>;
+};
 
 /* ---------- Provider → Model 候補 ---------- */
 const MODEL_OPTIONS: Record<Provider,string[]> = {
@@ -41,30 +51,23 @@ const MODEL_OPTIONS: Record<Provider,string[]> = {
   ]
 };
 
-type ApiCfg = {
-  provider: Provider;
-  model: string;
-  keys: Record<Provider,string>;
-};
-
 /* ---------- 色 ---------- */
 const primary = 'bg-[#0d1b2a]';
 const card    = 'bg-white shadow rounded';
 
 export default function ChatPage(){
 
-/* ===== 0 認証 ===== */
+/* ===== 認証チェック ===== */
 const router=useRouter();
 useEffect(()=>{supabase.auth.getSession()
   .then(({data:{session}})=>{if(!session)router.push('/login');});},[router]);
 
-/* ===== 1 state ===== */
+/* ===== state ===== */
 const [cfg,setCfg]=useState<ApiCfg>({
   provider:'openai',
   model:'gpt-3.5-turbo',
   keys:{openai:'',gemini:'',groq:'',anthropic:''}
 });
-/* localStorage 読み書き */
 useEffect(()=>{if(window){
   const s=localStorage.getItem('apiCfg'); if(s) setCfg(JSON.parse(s));
 }},[]);
@@ -85,7 +88,7 @@ const [input   ,setInput   ]=useState('');
 const [search  ,setSearch  ]=useState('');
 const [showCfg ,setShowCfg ]=useState(false);
 
-/* ===== 2 初回ロード ===== */
+/* ===== 初回ロード ===== */
 useEffect(()=>{(async()=>{
   const proj=(await supabase.from('project').select('*').order('id')).data??[];
   setProjects(proj);
@@ -95,7 +98,7 @@ useEffect(()=>{(async()=>{
   setLoading(false);
 })()},[]);
 
-/* ===== 3 CRUD ===== */
+/* ===== CRUD ===== */
 async function addProject(){
   if(!newProj.trim())return;
   const {data}=await supabase.from('project').insert({name:newProj}).select().single();
@@ -125,7 +128,7 @@ async function moveSession(sid:string,pid:string){
   setSessions(s=>s.map(v=>v.id===sid?{...v,project_id:pid}:v));
 }
 
-/* ===== 4 select & chat ===== */
+/* ===== select & chat ===== */
 async function selectSession(s:Session){
   setSelected(s);
   const {data}=await supabase.from('message').select('*').eq('session_id',s.id).order('id');
@@ -155,7 +158,7 @@ const onKey=(e:KeyboardEvent<HTMLInputElement>)=>{
   if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}
 };
 
-/* ===== 5 DnD 内部 ===== */
+/* ===== DnD 内部 ===== */
 const SessionItem=({s}:{s:Session})=>{
   const [,drag]=useDrag(()=>({type:'SESSION',item:{id:s.id}}),[s]);
   return(
@@ -186,13 +189,13 @@ const ProjectCol=({p}:{p:Project})=>{
   );
 };
 
-/* ===== 6 UI ===== */
+/* ===== UI ===== */
 if(loading) return <div className="p-6">Loading…</div>;
 return(
 <DndProvider backend={HTML5Backend}>
 <div className="flex h-screen">
 
-{/* ── sidebar ───────────────────────── */}
+{/* sidebar */}
 <aside className={`${primary} text-white w-80 p-4 space-y-3 relative`}>
   <button onClick={()=>setShowCfg(true)} className="absolute top-3 right-3 text-2xl">⚙️</button>
 
@@ -210,7 +213,7 @@ return(
   <LoginMail/>
 </aside>
 
-{/* ── chat area ─────────────────────── */}
+{/* chat */}
 <main className="flex-1 flex flex-col">
   <div className="p-2 border-b">
     <input value={search} onChange={e=>setSearch(e.target.value)}
@@ -233,7 +236,7 @@ return(
   </div>
 </main>
 
-{/* ── Config Modal ──────────────────── */}
+{/* Config Modal */}
 {showCfg&&(
   <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-20">
     <div className={`${card} w-96 p-6`}>
@@ -275,7 +278,7 @@ return(
 </DndProvider>
 );}
 
-/* ── Login mail left-bottom ─────────── */
+/* メールアドレス表示 */
 function LoginMail(){
   const [mail,setMail]=useState('');
   useEffect(()=>{supabase.auth.getUser().then(r=>setMail(r.data.user?.email||''));},[]);
