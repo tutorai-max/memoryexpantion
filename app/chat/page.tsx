@@ -1,11 +1,14 @@
-/* app/chat/page.tsx  ◆ “ConfigModal を JSX として使えない” 型エラー完全修正版
+/* app/chat/page.tsx  ◆ MemoryPlus 完全版 2025‑05‑07
    ────────────────────────────────────────────────
-   ▼ 今回のポイント
-   1. ConfigModal を **ファイル内でフル定義**（export しない内製コンポ）  
-   2. useDrag / useDrop ref キャストは前回の toCallbackRef で解決済み  
-   3. それ以外の機能（API 履歴・デフォルト・削除・検索・エラー表示など）は変更なし
+   ✅ GPT‑3.5 デフォルト接続 / Gemini キー例も動作
+   ✅ 「デフォルト」ボタン → 確認モーダルで切替
+   ✅ API 履歴を Provider+Model 付きで蓄積・重複排除
+   ✅ 左下に “現在の Provider / Model” を常時表示
+   ✅ チャット上部に “プロジェクト / セッション名”
+   ✅ 左上に サービス名 “MemoryPlus” ロゴ風
+   ✅ 新規セッション入力バグ修正（setTmpSess）
+   ────────────────────────────────────────────────
 */
-
 'use client';
 
 import { useEffect, useState, KeyboardEvent, RefCallback } from 'react';
@@ -20,7 +23,8 @@ type Session  = { id: string; name: string; project_id: string };
 type Message  = { id: number; session_id: string; role: 'user' | 'assistant'; content: string };
 type Provider = 'openai' | 'gemini' | 'groq' | 'anthropic';
 type ApiCfg   = { provider: Provider; model: string; keys: Record<Provider,string> };
-type ApiHist  = Record<Provider,{key:string;date:number}[]>;
+type HistRow  = { key:string; model:string; provider:Provider; date:number };
+type ApiHist  = HistRow[];
 
 /* ---------- Provider→Model 候補 ---------- */
 const MODEL_OPTIONS: Record<Provider,string[]> = {
@@ -45,19 +49,18 @@ useEffect(()=>{supabase.auth.getSession().then(({data:{session}})=>{if(!session)
 
 /* state */
 const [cfg,setCfg]=useState<ApiCfg>({provider:'openai',model:'gpt-3.5-turbo',keys:{openai:'',gemini:'',groq:'',anthropic:''}});
-const [hist,setHist]=useState<ApiHist>({openai:[],gemini:[],groq:[],anthropic:[]});
+const [hist,setHist]=useState<ApiHist>([]);
 useEffect(()=>{if(window){
   const s=localStorage.getItem('apiCfg');  if(s) setCfg(JSON.parse(s));
   const h=localStorage.getItem('apiHist'); if(h) setHist(JSON.parse(h));
 }},[]);
+
 const saveCfg=(patch:Partial<ApiCfg>,saveKey=false)=>{
-  const next={...cfg,...patch}; setCfg(next);
-  localStorage.setItem('apiCfg',JSON.stringify(next));
+  const next={...cfg,...patch}; setCfg(next); localStorage.setItem('apiCfg',JSON.stringify(next));
   if(saveKey){
-    const arr=[{key:next.keys[next.provider],date:Date.now()},...(hist[next.provider]||[])]
-      .filter((v,i,self)=>i===self.findIndex(x=>x.key===v.key)).slice(0,10);
-    const nextHist={...hist,[next.provider]:arr};
-    setHist(nextHist); localStorage.setItem('apiHist',JSON.stringify(nextHist));
+    const row:HistRow={key:next.keys[next.provider],provider:next.provider,model:next.model,date:Date.now()};
+    const arr=[row,...hist].filter((v,i,self)=>i===self.findIndex(x=>x.key===v.key&&x.provider===v.provider));
+    setHist(arr.slice(0,15)); localStorage.setItem('apiHist',JSON.stringify(arr.slice(0,15)));
   }
 };
 
@@ -71,6 +74,7 @@ const [tmpSess ,setTmpSess ]=useState<Record<string,string>>({});
 const [input   ,setInput   ]=useState('');
 const [search  ,setSearch  ]=useState('');
 const [showCfg ,setShowCfg ]=useState(false);
+const [confirmDef,setConfirmDef]=useState(false);
 const [apiErr  ,setApiErr  ]=useState('');
 
 /* 初期ロード */
@@ -89,7 +93,8 @@ async function deleteProject(id:string){
   await supabase.from('project').delete().eq('id',id);
   setProjects(p=>p.filter(v=>v.id!==id)); setSessions(s=>s.filter(v=>v.project_id!==id));
   if(selected?.project_id===id) setSelected(null);}
-async function addSession(pid:string){ const name=tmpSess[pid]?.trim(); if(!name)return;
+async function addSession(pid:string){
+  const name=tmpSess[pid]?.trim(); if(!name)return;
   const {data}=await supabase.from('session').insert({name,project_id:pid}).select().single();
   if(data) setSessions(s=>[...s,data]); setTmpSess({...tmpSess,[pid]:''});}
 async function deleteSession(id:string){
@@ -138,8 +143,8 @@ const ProjectCol=({p}:{p:Project})=>{
       <ul className="pl-2">{sessions.filter(v=>v.project_id===p.id).map(s=><SessionItem key={s.id} s={s}/>)}</ul>
       <div className="flex space-x-1 mt-2">
         <input className="flex-1 border px-1 rounded text-sm text-black"
-          value={tmpSess[p.id]||''}
-          onChange={e=>setTmpSess({...tmpSess,[p.id]:e.target.value})}
+          value={tmpSess[p.id]??''}
+          onChange={e=>setTmpSess(prev=>({...prev,[p.id]:e.target.value}))}
           placeholder="新規セッション…"/>
         <button onClick={()=>addSession(p.id)} className={`${primary} text-white px-2 rounded text-sm`}>＋</button>
       </div>
@@ -151,8 +156,10 @@ if(loading) return <div className="p-6">Loading…</div>;
 return(
 <DndProvider backend={HTML5Backend}>
 <div className="flex h-screen">
+
 {/* sidebar */}
 <aside className={`${primary} text-white w-80 p-4 space-y-3 relative`}>
+  <h1 className="text-xl font-bold mb-2">MemoryPlus</h1>
   <button onClick={()=>setShowCfg(true)} className="absolute top-3 right-3 text-2xl">⚙️</button>
   <div className="space-y-1">
     <input value={newProj} onChange={e=>setNewProj(e.target.value)}
@@ -160,18 +167,35 @@ return(
     <button onClick={addProject} className="w-full bg-white text-[#0d1b2a] py-1 rounded">追加</button>
   </div>
   <hr className="border-white/30"/>
-  <div className="overflow-y-auto h-[calc(100vh-220px)] pr-1">
+  <div className="overflow-y-auto h-[calc(100vh-260px)] pr-1">
     {projects.map(p=><ProjectCol key={p.id} p={p}/>)}
   </div>
+
+  {/* 左下 現在 Provider / Model */}
+  <div className="absolute bottom-6 left-3 text-xs opacity-80">{cfg.provider} / {cfg.model}</div>
   <LoginMail/>
 </aside>
 
 {/* chat area */}
 <main className="flex-1 flex flex-col">
+  {/* 現在プロジェクト / セッション */}
+  <div className="px-4 py-2 border-b bg-gray-50 text-sm">
+    {selected ? (
+      <>
+        <span className="font-semibold">{projects.find(p=>p.id===selected.project_id)?.name}</span>
+        {' / '}
+        <span>{selected.name}</span>
+      </>
+    ): 'セッション未選択'}
+  </div>
+
+  {/* 検索 */}
   <div className="p-2 border-b">
     <input value={search} onChange={e=>setSearch(e.target.value)}
       placeholder="履歴検索…" className="w-full border px-2 py-1 rounded text-black"/>
   </div>
+
+  {/* メッセージ */}
   <div className="flex-1 overflow-auto p-4 space-y-2 text-sm">
     {(search?messages.filter(m=>m.content.includes(search)):messages).map((m,i)=>
       <p key={i} className={m.role==='user'?'text-right':''}>
@@ -179,6 +203,8 @@ return(
       </p>)}
     {apiErr && <p className="text-red-600">{apiErr}</p>}
   </div>
+
+  {/* 入力 */}
   <div className="flex p-3 border-t space-x-2">
     <input className="flex-1 border px-2 rounded text-black" value={input}
       onChange={e=>setInput(e.target.value)} onKeyDown={onKey}/>
@@ -187,30 +213,28 @@ return(
 </main>
 
 {/* Config Modal */}
-{showCfg&&(
-  <ConfigModal cfg={cfg} hist={hist} saveCfg={saveCfg} close={()=>setShowCfg(false)}/>
-)}
+{showCfg&&<ConfigModal cfg={cfg} hist={hist} saveCfg={saveCfg} close={()=>setShowCfg(false)}
+  confirmDef={confirmDef} setConfirmDef={setConfirmDef}/>}
 </div>
 </DndProvider>
 );}
 
-/* ---------- ConfigModal コンポーネント ---------- */
-function ConfigModal({cfg,hist,saveCfg,close}:{cfg:ApiCfg;hist:ApiHist;saveCfg:(p:Partial<ApiCfg>,saveKey?:boolean)=>void;close:()=>void}){
+/* ---------- ConfigModal ---------- */
+function ConfigModal({cfg,hist,saveCfg,close,confirmDef,setConfirmDef}:{cfg:ApiCfg;hist:ApiHist;saveCfg:(p:Partial<ApiCfg>,saveKey?:boolean)=>void;close:()=>void;confirmDef:boolean;setConfirmDef:(v:boolean)=>void}){
   const [q,setQ]=useState('');
-  const list=hist[cfg.provider].filter(v=>v.key.includes(q));
+  const list=hist.filter(v=>v.key.includes(q)&&v.provider===cfg.provider);
   return(
     <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-20">
-      <div className={`${card} w-[430px] p-6`}>
+      <div className={`${card} w-[450px] p-6`}>
         <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg">API 設定</h3>
-          <button onClick={()=>saveCfg({provider:'openai',model:'gpt-3.5-turbo'},false)}
-            className="px-2 py-1 text-xs bg-gray-200 rounded">デフォルト</button>
+          <h3 className="text-lg font-medium">API 設定</h3>
+          <button onClick={()=>setConfirmDef(true)} className="px-2 py-1 text-xs bg-gray-200 rounded">デフォルト</button>
         </div>
 
         {/* Provider */}
         <label className="block text-sm mb-1">Provider</label>
         <select value={cfg.provider} onChange={e=>{
-          const p=e.target.value as Provider; saveCfg({provider:p,model:MODEL_OPTIONS[p][0]},false);}}
+          const p=e.target.value as Provider; saveCfg({provider:p,model:MODEL_OPTIONS[p][0]},false); setQ('');}}
           className="w-full border px-2 py-1 rounded mb-3 text-black">
           <option value="openai">OpenAI</option><option value="gemini">Gemini</option>
           <option value="groq">Groq</option><option value="anthropic">Anthropic</option>
@@ -241,7 +265,8 @@ function ConfigModal({cfg,hist,saveCfg,close}:{cfg:ApiCfg;hist:ApiHist;saveCfg:(
           {list.map((v,i)=>
             <div key={i} className="flex items-center text-xs mb-1 truncate">
               <span className="flex-1 truncate">{v.key}</span>
-              <button onClick={()=>saveCfg({keys:{...cfg.keys,[cfg.provider]:v.key}},false)}
+              <span className="mx-1 opacity-70">{v.model}</span>
+              <button onClick={()=>saveCfg({keys:{...cfg.keys,[cfg.provider]:v.key},model:v.model},false)}
                 className="ml-2 px-1 bg-gray-200 rounded">これを使用</button>
             </div>)}
           {!list.length&&<p className="text-xs opacity-60">履歴なし</p>}
@@ -249,6 +274,20 @@ function ConfigModal({cfg,hist,saveCfg,close}:{cfg:ApiCfg;hist:ApiHist;saveCfg:(
 
         <button onClick={close} className={`${primary} text-white w-full py-1 mt-4 rounded`}>閉じる</button>
       </div>
+
+      {/* 確認モーダル */}
+      {confirmDef&&(
+        <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+          <div className={`${card} p-6 w-64 text-center`}>
+            <p className="mb-4 text-sm">モデルをデフォルトに切替えますか？</p>
+            <div className="flex justify-center space-x-4">
+              <button onClick={()=>{saveCfg({provider:'openai',model:'gpt-3.5-turbo'},false);setConfirmDef(false);}}
+                className={`${primary} text-white px-4 py-1 rounded`}>確認</button>
+              <button onClick={()=>setConfirmDef(false)} className="px-4 py-1 border rounded">キャンセル</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -257,5 +296,5 @@ function ConfigModal({cfg,hist,saveCfg,close}:{cfg:ApiCfg;hist:ApiHist;saveCfg:(
 function LoginMail(){
   const [mail,setMail]=useState('');
   useEffect(()=>{supabase.auth.getUser().then(r=>setMail(r.data.user?.email||''));},[]);
-  return <div className="absolute bottom-3 left-3 text-xs opacity-70">{mail}</div>;
+  return <div className="absolute bottom-2 left-3 text-xs opacity-70">{mail}</div>;
 }
