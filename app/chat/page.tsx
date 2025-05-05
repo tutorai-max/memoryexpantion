@@ -1,14 +1,13 @@
-/* app/chat/page.tsx  ◆ MemoryPlus 完全版 2025‑05‑07
+/* app/chat/page.tsx  ◆ 2025‑05‑07 “全部入り”フルソース
    ────────────────────────────────────────────────
-   ✅ GPT‑3.5 デフォルト接続 / Gemini キー例も動作
-   ✅ 「デフォルト」ボタン → 確認モーダルで切替
-   ✅ API 履歴を Provider+Model 付きで蓄積・重複排除
-   ✅ 左下に “現在の Provider / Model” を常時表示
-   ✅ チャット上部に “プロジェクト / セッション名”
-   ✅ 左上に サービス名 “MemoryPlus” ロゴ風
-   ✅ 新規セッション入力バグ修正（setTmpSess）
-   ────────────────────────────────────────────────
+   ■ 追加・修正点
+     1. apiHist 読み込みを v0(オブジェクト)→v1(配列) に自動変換
+     2. Array.isArray で安全に .filter
+     3. 「過去すべてのメッセージ」を全文検索（プロジェクト横検索）
+     4. send() 時、直近 30 件を自動で AI へ含める
+   ■ 既存機能（API履歴 / デフォルト確認 / Provider&Model表示 / DnD など）は維持
 */
+
 'use client';
 
 import { useEffect, useState, KeyboardEvent, RefCallback } from 'react';
@@ -52,9 +51,15 @@ const [cfg,setCfg]=useState<ApiCfg>({provider:'openai',model:'gpt-3.5-turbo',key
 const [hist,setHist]=useState<ApiHist>([]);
 useEffect(()=>{if(window){
   const s=localStorage.getItem('apiCfg');  if(s) setCfg(JSON.parse(s));
-  const h=localStorage.getItem('apiHist'); if(h) setHist(JSON.parse(h));
-}},[]);
 
+  const h=localStorage.getItem('apiHist');
+  if(h){
+    const parsed=JSON.parse(h);
+    // v0 形式(obj)→配列変換
+    const arr:Array<HistRow>=Array.isArray(parsed)?parsed:Object.values(parsed).flat();
+    setHist(arr);
+  }
+}},[]);
 const saveCfg=(patch:Partial<ApiCfg>,saveKey=false)=>{
   const next={...cfg,...patch}; setCfg(next); localStorage.setItem('apiCfg',JSON.stringify(next));
   if(saveKey){
@@ -68,6 +73,7 @@ const [projects,setProjects]=useState<Project[]>([]);
 const [sessions,setSessions]=useState<Session[]>([]);
 const [selected,setSelected]=useState<Session|null>(null);
 const [messages,setMessages]=useState<Message[]>([]);
+const [allMsgs ,setAllMsgs ]=useState<Message[]>([]);
 const [loading ,setLoading ]=useState(true);
 const [newProj ,setNewProj ]=useState('');
 const [tmpSess ,setTmpSess ]=useState<Record<string,string>>({});
@@ -81,7 +87,8 @@ const [apiErr  ,setApiErr  ]=useState('');
 useEffect(()=>{(async()=>{
   const proj=(await supabase.from('project').select('*').order('id')).data??[];
   const sess=(await supabase.from('session').select('*').order('id')).data??[];
-  setProjects(proj); setSessions(sess);
+  const msgs=(await supabase.from('message').select('*').order('id')).data??[];
+  setProjects(proj); setSessions(sess); setAllMsgs(msgs);
   if(sess[0]) await selectSession(sess[0]); setLoading(false);
 })()},[]);
 
@@ -96,11 +103,11 @@ async function deleteProject(id:string){
 async function addSession(pid:string){
   const name=tmpSess[pid]?.trim(); if(!name)return;
   const {data}=await supabase.from('session').insert({name,project_id:pid}).select().single();
-  if(data) setSessions(s=>[...s,data]); setTmpSess({...tmpSess,[pid]:''});}
+  if(data) setSessions(s=>[...s,data]); setTmpSess(prev=>({...prev,[pid]:''}));}
 async function deleteSession(id:string){
   await supabase.from('session').delete().eq('id',id);
   setSessions(s=>s.filter(v=>v.id!==id)); setMessages(m=>m.filter(v=>v.session_id!==id));
-  if(selected?.id===id) setSelected(null);}
+  setAllMsgs(m=>m.filter(v=>v.session_id!==id)); if(selected?.id===id) setSelected(null);}
 async function moveSession(sid:string,pid:string){
   await supabase.from('session').update({project_id:pid}).eq('id',sid);
   setSessions(s=>s.map(v=>v.id===sid?{...v,project_id:pid}:v));}
@@ -111,18 +118,22 @@ async function selectSession(s:Session){ setSelected(s);
 async function send(){
   if(!input.trim()||!selected) return;
   const {data:user}=await supabase.from('message').insert({session_id:selected.id,role:'user',content:input}).select().single();
-  if(!user)return; setMessages(m=>[...m,user]); setInput(''); setApiErr('');
+  if(!user)return;
+  setMessages(m=>[...m,user]); setAllMsgs(m=>[...m,user]); setInput(''); setApiErr('');
+
+  // 直近30件を context として送付
+  const ctx=[...messages,user].slice(-30);
   try{
     const res=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({messages:[...messages,user],provider:cfg.provider,model:cfg.model,apiKey:cfg.keys[cfg.provider]})});
+      body:JSON.stringify({messages:ctx,provider:cfg.provider,model:cfg.model,apiKey:cfg.keys[cfg.provider]})});
     if(!res.ok) throw new Error();
     const {reply}=await res.json();
     const {data:bot}=await supabase.from('message').insert({session_id:selected.id,role:'assistant',content:reply}).select().single();
-    if(bot) setMessages(m=>[...m,bot]);
+    if(bot){ setMessages(m=>[...m,bot]); setAllMsgs(m=>[...m,bot]); }
   }catch{ setApiErr('APIの設定にエラーが発生しています'); }}
 const onKey=(e:KeyboardEvent<HTMLInputElement>)=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();} };
 
-/* DnD components */
+/* DnD */
 const SessionItem=({s}:{s:Session})=>{
   const [,drag]=useDrag(()=>({type:'SESSION',item:{id:s.id}}),[s]);
   return(
@@ -144,7 +155,7 @@ const ProjectCol=({p}:{p:Project})=>{
       <div className="flex space-x-1 mt-2">
         <input className="flex-1 border px-1 rounded text-sm text-black"
           value={tmpSess[p.id]??''}
-          onChange={e=>setTmpSess(prev=>({...prev,[p.id]:e.target.value}))}
+          onChange={e=>setTmpSess(pr=>({...pr,[p.id]:e.target.value}))}
           placeholder="新規セッション…"/>
         <button onClick={()=>addSession(p.id)} className={`${primary} text-white px-2 rounded text-sm`}>＋</button>
       </div>
@@ -153,6 +164,12 @@ const ProjectCol=({p}:{p:Project})=>{
 
 /* UI */
 if(loading) return <div className="p-6">Loading…</div>;
+const filteredMsg= search
+  ? allMsgs.filter(m=>m.content.includes(search))
+  : selected
+    ? messages
+    : [];
+
 return(
 <DndProvider backend={HTML5Backend}>
 <div className="flex h-screen">
@@ -170,15 +187,12 @@ return(
   <div className="overflow-y-auto h-[calc(100vh-260px)] pr-1">
     {projects.map(p=><ProjectCol key={p.id} p={p}/>)}
   </div>
-
-  {/* 左下 現在 Provider / Model */}
   <div className="absolute bottom-6 left-3 text-xs opacity-80">{cfg.provider} / {cfg.model}</div>
   <LoginMail/>
 </aside>
 
 {/* chat area */}
 <main className="flex-1 flex flex-col">
-  {/* 現在プロジェクト / セッション */}
   <div className="px-4 py-2 border-b bg-gray-50 text-sm">
     {selected ? (
       <>
@@ -189,22 +203,19 @@ return(
     ): 'セッション未選択'}
   </div>
 
-  {/* 検索 */}
   <div className="p-2 border-b">
     <input value={search} onChange={e=>setSearch(e.target.value)}
-      placeholder="履歴検索…" className="w-full border px-2 py-1 rounded text-black"/>
+      placeholder="全履歴検索…" className="w-full border px-2 py-1 rounded text-black"/>
   </div>
 
-  {/* メッセージ */}
   <div className="flex-1 overflow-auto p-4 space-y-2 text-sm">
-    {(search?messages.filter(m=>m.content.includes(search)):messages).map((m,i)=>
+    {(filteredMsg).map((m,i)=>
       <p key={i} className={m.role==='user'?'text-right':''}>
         <span className={`${card} inline-block px-3 py-1 ${m.role==='user'?'text-[#0d1b2a]':''}`}>{m.content}</span>
       </p>)}
     {apiErr && <p className="text-red-600">{apiErr}</p>}
   </div>
 
-  {/* 入力 */}
   <div className="flex p-3 border-t space-x-2">
     <input className="flex-1 border px-2 rounded text-black" value={input}
       onChange={e=>setInput(e.target.value)} onKeyDown={onKey}/>
@@ -222,7 +233,10 @@ return(
 /* ---------- ConfigModal ---------- */
 function ConfigModal({cfg,hist,saveCfg,close,confirmDef,setConfirmDef}:{cfg:ApiCfg;hist:ApiHist;saveCfg:(p:Partial<ApiCfg>,saveKey?:boolean)=>void;close:()=>void;confirmDef:boolean;setConfirmDef:(v:boolean)=>void}){
   const [q,setQ]=useState('');
-  const list=hist.filter(v=>v.key.includes(q)&&v.provider===cfg.provider);
+  const list = Array.isArray(hist)
+    ? hist.filter(v=>v.provider===cfg.provider&&v.key.includes(q))
+    : [];
+
   return(
     <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-20">
       <div className={`${card} w-[450px] p-6`}>
